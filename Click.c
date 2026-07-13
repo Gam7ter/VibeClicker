@@ -15,13 +15,12 @@ typedef enum {
 
 typedef struct {
     ActionType type;
-    WORD vKey;        // Для клавиатуры (VK_CODE)
-    bool isKeyDown;   // true = KeyDown, false = KeyUp
-    int mouseButton;  // 1 = Left, 2 = Right
-    DWORD delayMs;    // Время задержки в мс
+    WORD vKey;
+    bool isKeyDown;
+    int mouseButton;
+    DWORD delayMs;
 } Action;
 
-// Глобальные переменные
 Action script[MAX_ACTIONS];
 int script_size = 0;
 WORD key_start = VK_F6;
@@ -31,12 +30,12 @@ bool is_running = false;
 bool in_main_menu = false;
 HANDLE hThread = NULL;
 
-// Прототипы функций
 void SaveConfig();
 void LoadConfig();
 void DisplayScript();
 void DisplayMenu();
 void DisplayAsciiKeyboard();
+int ConfigureAction(Action* out_actions);
 void AddAction();
 void DeleteAction();
 void ModifyAction();
@@ -213,7 +212,6 @@ void DisplayAsciiKeyboard() {
     printf("==============================================================================================\n");
 }
 
-// Универсальный хелпер для настройки параметров действия (используется при создании и изменении)
 int ConfigureAction(Action* out_actions) {
     printf("\nВыберите тип действия:\n1. Клавиатура\n2. Мышь\n3. Задержка\n0. Назад в меню\nВыбор: ");
     int typeChoice;
@@ -316,7 +314,7 @@ void DeleteAction() {
     int index;
     scanf_s("%d", &index);
 
-    if (index == 0) return; // Возврат в меню без ошибок
+    if (index == 0) return;
 
     if (index < 1 || index > script_size) {
         printf("Неверный номер действия!\n");
@@ -324,7 +322,6 @@ void DeleteAction() {
         return;
     }
 
-    // Сдвигаем элементы влево
     for (int i = index - 1; i < script_size - 1; i++) {
         script[i] = script[i + 1];
     }
@@ -371,12 +368,11 @@ void ModifyAction() {
             _getch();
             return;
         }
-        // Раздвигаем массив вправо на 1 позицию, освобождая место
         for (int i = script_size; i > index; i--) {
             script[i] = script[i - 1];
         }
-        script[index - 1] = buffer[0]; // Сюда падает KeyDown
-        script[index] = buffer[1];     // А сюда автоматом встает KeyUp
+        script[index - 1] = buffer[0];
+        script[index] = buffer[1];
         script_size++;
     }
 
@@ -403,13 +399,12 @@ void ChangeHotkeys() {
 }
 
 int main() {
-    // Устанавливаем UTF-8 кодировку консоли для поддержки кириллицы
+
     SetConsoleCP(65001);
     SetConsoleOutputCP(65001);
 
     LoadConfig();
 
-    // Создаем поток для фонового кликера
     hThread = CreateThread(NULL, 0, MacroThreadProc, NULL, 0, NULL);
 
     while (true) {
@@ -428,14 +423,11 @@ int main() {
         printf("5. Выйти из программы\n");
         printf("\nВыберите пункт меню: ");
 
-        // Разрешаем фоновому потоку реагировать на горячие клавиши
         in_main_menu = true; 
 
-        // Ожидаем ввода без жесткого блокирования, чтобы меню могло перерисовываться при фоновом старте/стопе
         char choice = '0';
         while (!_kbhit()) {
             Sleep(50);
-            // Если в фоне прожался старт/стоп, обновим состояние текста на экране
             static bool last_state = false;
             if (is_running != last_state) {
                 last_state = is_running;
@@ -449,7 +441,6 @@ int main() {
             continue; 
         }
 
-        // Выключаем реакцию на горячие клавиши во время редактирования данных в подменю
         in_main_menu = false; 
 
         if (choice == '1') {
