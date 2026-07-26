@@ -1,4 +1,4 @@
 @echo off
 windres resource.rc -o resource.o
-gcc Click.c resource.o -o Click.exe -lwinmm
+gcc main.c resource.o -o VibeClicker.exe -lwinmm
 pause
