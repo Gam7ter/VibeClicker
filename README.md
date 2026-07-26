@@ -8,7 +8,6 @@
 
 ![Language](https://img.shields.io/badge/Language-C-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)
-![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Built With AI](https://img.shields.io/badge/Built%20With-AI%20Collaborator-purple.svg)
 
 **VibeClicker** — инструмент для автоматизации действий клавиатуры и мыши, спроектированный и оптимизированный при участии нейросети. Проект сочетает минималистичный консольный интерфейс, высокую точность задержек и гибкую систему профилей.
