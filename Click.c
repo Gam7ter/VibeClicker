@@ -1,11 +1,16 @@
 #include <windows.h>
+#include <mmsystem.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <conio.h>
+#include <string.h>
 
 #define MAX_ACTIONS 256
-#define CONFIG_FILE "clicker_config.dat"
+#define MAX_PROFILES 10
+#define MAX_NAME_LEN 32
+#define PROFILES_DIR "profiles"
+#define INDEX_FILE "profiles/profiles.dat"
 
 typedef enum {
     ACTION_KEYBOARD,
@@ -21,19 +26,31 @@ typedef struct {
     DWORD delayMs;
 } Action;
 
-Action script[MAX_ACTIONS];
-int script_size = 0;
-WORD key_start = VK_F6;
-WORD key_stop = VK_F7;
+typedef struct {
+    char name[MAX_NAME_LEN];
+    WORD key_start;
+    WORD key_stop;
+    int script_size;
+    Action script[MAX_ACTIONS];
+} Profile;
 
+// Глобальные переменные профилей
+Profile current_profile;
+int current_profile_index = 0;
+char profile_names[MAX_PROFILES][MAX_NAME_LEN];
+
+volatile BOOL is_thread_active = TRUE;
 bool is_running = false;
 bool in_main_menu = false;
 HANDLE hThread = NULL;
 
-void SaveConfig();
-void LoadConfig();
+// Прототипы функций
+void SaveCurrentProfile();
+void LoadProfile(int index);
+void SaveProfileIndex();
+void LoadProfileIndex();
+void ManageProfiles();
 void DisplayScript();
-void DisplayMenu();
 void DisplayAsciiKeyboard();
 int ConfigureAction(Action* out_actions);
 void AddAction();
@@ -42,7 +59,49 @@ void ModifyAction();
 void ChangeHotkeys();
 void GetKeyNameStr(WORD vk, char* dest, int maxLen);
 void PreciseSleep(double ms);
+void ReadInputString(char* dest, int maxLen);
+int ReadIntInput();
+unsigned int ReadHexInput();
 DWORD WINAPI MacroThreadProc(LPVOID lpParam);
+
+// Надежно считывает строку напрямую через API Windows Unicode
+void ReadInputString(char* dest, int maxLen) {
+    HANDLE hInput = GetStdHandle(STD_INPUT_HANDLE);
+    FlushConsoleInputBuffer(hInput);
+    
+    WCHAR wbuf[512] = {0};
+    DWORD charsRead = 0;
+
+    DWORD mode;
+    GetConsoleMode(hInput, &mode);
+    SetConsoleMode(hInput, mode | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+
+    if (ReadConsoleW(hInput, wbuf, 511, &charsRead, NULL)) {
+        for (DWORD i = 0; i < charsRead; i++) {
+            if (wbuf[i] == L'\r' || wbuf[i] == L'\n') {
+                wbuf[i] = L'\0';
+                break;
+            }
+        }
+        WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, dest, maxLen, NULL, NULL);
+    } else {
+        dest[0] = '\0';
+    }
+}
+
+// Безопасное чтение целых чисел
+int ReadIntInput() {
+    char buf[64] = {0};
+    ReadInputString(buf, sizeof(buf));
+    return atoi(buf);
+}
+
+// Безопасное чтение HEX-значений
+unsigned int ReadHexInput() {
+    char buf[64] = {0};
+    ReadInputString(buf, sizeof(buf));
+    return (unsigned int)strtoul(buf, NULL, 16);
+}
 
 void PreciseSleep(double ms) {
     LARGE_INTEGER freq, start, now;
@@ -51,14 +110,25 @@ void PreciseSleep(double ms) {
 
     double target_ticks = (ms / 1000.0) * freq.QuadPart;
 
-    while (is_running) {
-        if (GetAsyncKeyState(key_stop) & 0x8000) {
+    while (is_running && is_thread_active) {
+        if (GetAsyncKeyState(current_profile.key_stop) & 0x8000) {
             is_running = false;
             break;
         }
+
         QueryPerformanceCounter(&now);
-        if ((now.QuadPart - start.QuadPart) >= target_ticks) break;
-        Sleep(0);
+        double elapsed_ticks = (double)(now.QuadPart - start.QuadPart);
+        double remaining_ticks = target_ticks - elapsed_ticks;
+
+        if (remaining_ticks <= 0) break;
+
+        double remaining_ms = (remaining_ticks / freq.QuadPart) * 1000.0;
+
+        if (remaining_ms > 1.5) {
+            Sleep(1); 
+        } else {
+            Sleep(0); 
+        }
     }
 }
 
@@ -88,25 +158,24 @@ void GetKeyNameStr(WORD vk, char* dest, int maxLen) {
 }
 
 DWORD WINAPI MacroThreadProc(LPVOID lpParam) {
-    while (true) {
+    while (is_thread_active) {
         if (in_main_menu) {
-            if ((GetAsyncKeyState(key_start) & 0x8000) && !is_running) {
+            if ((GetAsyncKeyState(current_profile.key_start) & 0x8000) && !is_running) {
                 is_running = true;
-                printf("\n[Скрипт ЗАПУЩЕН]\n");
             }
-            if (GetAsyncKeyState(key_stop) & 0x8000) {
+            if (GetAsyncKeyState(current_profile.key_stop) & 0x8000) {
                 is_running = false;
             }
         }
 
-        if (is_running && script_size > 0) {
-            for (int i = 0; i < script_size && is_running; i++) {
+        if (is_running && current_profile.script_size > 0) {
+            for (int i = 0; i < current_profile.script_size && is_running; i++) {
                 if (!in_main_menu) {
                     is_running = false; 
                     break; 
                 }
                 
-                Action act = script[i];
+                Action act = current_profile.script[i];
                 if (act.type == ACTION_KEYBOARD) {
                     INPUT input = {0};
                     input.type = INPUT_KEYBOARD;
@@ -136,60 +205,185 @@ DWORD WINAPI MacroThreadProc(LPVOID lpParam) {
     return 0;
 }
 
-void SaveConfig() {
+// ----------------- РАБОТА С ПРОФИЛЯМИ И ФАЙЛАМИ -----------------
+
+void GetProfileFilename(int index, char* filename, size_t size) {
+    sprintf_s(filename, size, "profiles/profile_%d.dat", index);
+}
+
+void SaveProfileIndex() {
     FILE* f = NULL;
-    if (fopen_s(&f, CONFIG_FILE, "wb") == 0) {
-        fwrite(&key_start, sizeof(WORD), 1, f);
-        fwrite(&key_stop, sizeof(WORD), 1, f);
-        fwrite(&script_size, sizeof(int), 1, f);
-        if (script_size > 0) {
-            fwrite(script, sizeof(Action), script_size, f);
-        }
+    if (fopen_s(&f, INDEX_FILE, "wb") == 0) {
+        fwrite(&current_profile_index, sizeof(int), 1, f);
+        fwrite(profile_names, sizeof(profile_names), 1, f);
         fclose(f);
     }
 }
 
-void LoadConfig() {
+void LoadProfileIndex() {
     FILE* f = NULL;
-    if (fopen_s(&f, CONFIG_FILE, "rb") == 0) {
-        fread(&key_start, sizeof(WORD), 1, f);
-        fread(&key_stop, sizeof(WORD), 1, f);
-        fread(&script_size, sizeof(int), 1, f);
-        if (script_size > MAX_ACTIONS) script_size = MAX_ACTIONS;
-        if (script_size > 0) {
-            fread(script, sizeof(Action), script_size, f);
-        }
+    if (fopen_s(&f, INDEX_FILE, "rb") == 0) {
+        fread(&current_profile_index, sizeof(int), 1, f);
+        fread(profile_names, sizeof(profile_names), 1, f);
         fclose(f);
+    } else {
+        current_profile_index = 0;
+        for (int i = 0; i < MAX_PROFILES; i++) {
+            sprintf_s(profile_names[i], MAX_NAME_LEN, "Профиль %d", i + 1);
+        }
+        SaveProfileIndex();
     }
 }
+
+void SaveCurrentProfile() {
+    char filename[64];
+    GetProfileFilename(current_profile_index, filename, sizeof(filename));
+    
+    FILE* f = NULL;
+    if (fopen_s(&f, filename, "wb") == 0) {
+        fwrite(&current_profile, sizeof(Profile), 1, f);
+        fclose(f);
+    }
+    SaveProfileIndex();
+}
+
+void LoadProfile(int index) {
+    if (index < 0 || index >= MAX_PROFILES) return;
+    
+    current_profile_index = index;
+    char filename[64];
+    GetProfileFilename(index, filename, sizeof(filename));
+    
+    FILE* f = NULL;
+    if (fopen_s(&f, filename, "rb") == 0) {
+        fread(&current_profile, sizeof(Profile), 1, f);
+        fclose(f);
+    } else {
+        memset(&current_profile, 0, sizeof(Profile));
+        strcpy_s(current_profile.name, MAX_NAME_LEN, profile_names[index]);
+        current_profile.key_start = VK_F6;
+        current_profile.key_stop = VK_F7;
+        current_profile.script_size = 0;
+        SaveCurrentProfile();
+    }
+}
+
+void ManageProfiles() {
+    while (true) {
+        system("cls");
+        printf("==================================================\n");
+        printf(" МЕНЕДЖЕР ПРОФИЛЕЙ\n");
+        printf("==================================================\n");
+        for (int i = 0; i < MAX_PROFILES; i++) {
+            printf(" %2d. %s %s\n", i + 1, profile_names[i], 
+                   (i == current_profile_index) ? "[АКТИВЕН]" : "");
+        }
+        printf("--------------------------------------------------\n");
+        printf(" [1-9, 0] - Сменить активный профиль (1..10)\n");
+        printf(" [R / К]  - Переименовать профиль\n");
+        printf(" [ESC]    - Назад в главное меню\n");
+        printf("==================================================\n");
+        printf("Выберите действие: ");
+
+        int c = _getch();
+
+        // Выход по Esc или 'b'/'q'
+        if (c == 27 || c == 'b' || c == 'B' || c == 'q' || c == 'Q') {
+            break;
+        }
+
+        // Проверка клавиши R/К на любой раскладке
+        bool is_rename = (c == 'r' || c == 'R' || 
+                          (unsigned char)c == 0xAA || (unsigned char)c == 0xEA || 
+                          (unsigned char)c == 0x8A || (unsigned char)c == 0xCA ||
+                          (unsigned char)c == 0xD0 || (unsigned char)c == 0xD1 ||
+                          (unsigned char)c == 0xBA || (unsigned char)c == 0xDA);
+
+        if (!is_rename && (GetAsyncKeyState('R') & 0x8000)) {
+            is_rename = true;
+        }
+
+        if (is_rename) {
+            printf("\n\nВведите номер профиля для переименования (1-%d): ", MAX_PROFILES);
+            
+            int idx = ReadIntInput();
+
+            if (idx >= 1 && idx <= MAX_PROFILES) {
+                printf("Введите новое название (нажмите Enter, чтобы оставить \"%s\"): ", profile_names[idx - 1]);
+                
+                char temp_name[MAX_NAME_LEN] = {0};
+                ReadInputString(temp_name, sizeof(temp_name));
+
+                bool is_empty = true;
+                for (int k = 0; temp_name[k] != '\0'; k++) {
+                    if ((unsigned char)temp_name[k] > 32) {
+                        is_empty = false;
+                        break;
+                    }
+                }
+
+                if (!is_empty) {
+                    strcpy_s(profile_names[idx - 1], MAX_NAME_LEN, temp_name);
+                    if (idx - 1 == current_profile_index) {
+                        strcpy_s(current_profile.name, MAX_NAME_LEN, temp_name);
+                        SaveCurrentProfile();
+                    } else {
+                        SaveProfileIndex();
+                    }
+                    printf("Название профиля обновлено!\n");
+                } else {
+                    printf("Название оставлено без изменений.\n");
+                }
+            } else {
+                printf("Неверный номер профиля!\n");
+            }
+            Sleep(1000);
+        }
+        else if (c >= '1' && c <= '9') {
+            int idx = c - '1';
+            LoadProfile(idx);
+            printf("\n\nАктивирован профиль: %s\n", current_profile.name);
+            Sleep(700);
+        }
+        else if (c == '0') {
+            int idx = 9; // Профиль 10
+            LoadProfile(idx);
+            printf("\n\nАктивирован профиль: %s\n", current_profile.name);
+            Sleep(700);
+        }
+    }
+}
+
+// ----------------------------------------------------------------
 
 void DisplayScript() {
     char keyStartName[32], keyStopName[32];
-    GetKeyNameStr(key_start, keyStartName, 32);
-    GetKeyNameStr(key_stop, keyStopName, 32);
+    GetKeyNameStr(current_profile.key_start, keyStartName, 32);
+    GetKeyNameStr(current_profile.key_stop, keyStopName, 32);
 
     printf("==================================================\n");
-    printf(" ТЕКУЩИЙ СКРИПТ (Старт: %s | Стоп: %s)\n", keyStartName, keyStopName);
+    printf(" ПРОФИЛЬ: %s\n", current_profile.name);
+    printf(" (Старт: %s | Стоп: %s)\n", keyStartName, keyStopName);
     printf("==================================================\n");
     
-    if (script_size == 0) {
+    if (current_profile.script_size == 0) {
         printf(" [Скрипт пуст]\n");
     } else {
-        for (int i = 0; i < script_size; i++) {
+        for (int i = 0; i < current_profile.script_size; i++) {
             printf(" %d. ", i + 1);
             char keyName[32];
-            switch (script[i].type) {
+            switch (current_profile.script[i].type) {
                 case ACTION_KEYBOARD:
-                    GetKeyNameStr(script[i].vKey, keyName, 32);
-                    printf("Клавиатура: %s [%s]\n", keyName, script[i].isKeyDown ? "НАЖАТЬ" : "ОТПУСТИТЬ");
+                    GetKeyNameStr(current_profile.script[i].vKey, keyName, 32);
+                    printf("Клавиатура: %s [%s]\n", keyName, current_profile.script[i].isKeyDown ? "НАЖАТЬ" : "ОТПУСТИТЬ");
                     break;
                 case ACTION_MOUSE:
                     printf("Мышь: %s %s\n", 
-                           script[i].mouseButton == 1 ? "ЛЕВАЯ" : "ПРАВАЯ", 
-                           script[i].isKeyDown ? "НАЖАТЬ" : "ОТПУСТИТЬ");
+                           current_profile.script[i].mouseButton == 1 ? "ЛЕВАЯ" : "ПРАВАЯ", 
+                           current_profile.script[i].isKeyDown ? "НАЖАТЬ" : "ОТПУСТИТЬ");
                     break;
                 case ACTION_DELAY:
-                    printf("Задержка: %lu мс\n", script[i].delayMs);
+                    printf("Задержка: %lu мс\n", current_profile.script[i].delayMs);
                     break;
             }
         }
@@ -206,28 +400,25 @@ void DisplayAsciiKeyboard() {
     printf("     [31:1] [32:2] [33:3]  [34:4]  [35:5] [36:6] [37:7] [38:8] [39:9] [30:0] [08:Backspace] [67:7] [68:8] [69:9] [6F:/]\n");
     printf("[09:Tab] [51:Q] [57:W] [45:E] [52:R] [54:T] [59:Y] [55:U] [49:I] [4F:O] [50:P]              [64:4] [65:5] [66:6] [6A:*]\n");
     printf("[14:Caps] [41:A] [53:S] [44:D] [46:F] [47:G] [48:H] [4A:J] [4B:K] [4C:L] [0D:Ent]           [61:1] [62:2] [63:3] [6D:-]\n");
-    printf("[10:Shft]    [5A:Z] [58:X] [43:C] [56:V] [42:B] [4E:N] [4D:M]                                      [60:0] [6E:.] [6B:+]\n");
-    printf("[11:Ctrl] [12:Alt]       [20:             Space             ]                           \n\n");
+    printf("[10:Shft]    [5A:Z] [58:X] [43:C] [56:V] [42:B] [4E:N] [4D:M]                                    [60:0] [6E:.] [6B:+]\n");
+    printf("[11:Ctrl] [12:Alt]       [20:               Space             ]                               \n\n");
 
     printf("==============================================================================================\n");
 }
 
 int ConfigureAction(Action* out_actions) {
     printf("\nВыберите тип действия:\n1. Клавиатура\n2. Мышь\n3. Задержка\n0. Назад в меню\nВыбор: ");
-    int typeChoice;
-    scanf_s("%d", &typeChoice);
+    int typeChoice = ReadIntInput();
 
     if (typeChoice == 0) return 0; 
 
     if (typeChoice == 1) {
         DisplayAsciiKeyboard();
         printf("\nВведите HEX-код нужной клавиши из таблицы выше: ");
-        unsigned int hexKey;
-        scanf_s("%x", &hexKey);
+        unsigned int hexKey = ReadHexInput();
 
         printf("Выберите событие:\n1. Нажатие (KeyDown)\n2. Отпускание (KeyUp)\n3. Нажатие и отпускание (Клик)\n0. Назад в меню\nВыбор: ");
-        int stateChoice;
-        scanf_s("%d", &stateChoice);
+        int stateChoice = ReadIntInput();
         if (stateChoice == 0) return 0; 
         
         if (stateChoice == 1 || stateChoice == 2) {
@@ -243,13 +434,11 @@ int ConfigureAction(Action* out_actions) {
     } 
     else if (typeChoice == 2) {
         printf("Выберите кнопку мыши:\n1. Левая\n2. Правая\n0. Назад в меню\nВыбор: ");
-        int mouseChoice;
-        scanf_s("%d", &mouseChoice);
+        int mouseChoice = ReadIntInput();
         if (mouseChoice == 0) return 0; 
         
         printf("Выберите событие:\n1. Нажатие (MouseDown)\n2. Отпускание (MouseUp)\n3. Нажатие и отпускание (Клик)\n0. Назад в меню\nВыбор: ");
-        int stateChoice;
-        scanf_s("%d", &stateChoice);
+        int stateChoice = ReadIntInput();
         if (stateChoice == 0) return 0; 
         
         if (stateChoice == 1 || stateChoice == 2) {
@@ -266,14 +455,14 @@ int ConfigureAction(Action* out_actions) {
     else if (typeChoice == 3) {
         out_actions[0].type = ACTION_DELAY;
         printf("Введите время задержки в миллисекундах (мс): ");
-        scanf_s("%lu", &(out_actions[0].delayMs));
+        out_actions[0].delayMs = (DWORD)ReadIntInput();
         return 1;
     }
     return 0;
 }
 
 void AddAction() {
-    if (script_size >= MAX_ACTIONS) {
+    if (current_profile.script_size >= MAX_ACTIONS) {
         printf("Достигнут предел количества действий!\n");
         _getch();
         return;
@@ -288,62 +477,60 @@ void AddAction() {
         return;
     }
     
-    if (script_size + count > MAX_ACTIONS) {
+    if (current_profile.script_size + count > MAX_ACTIONS) {
         printf("Ошибка: недостаточно места в скрипте!\n");
         _getch();
         return;
     }
 
     for (int i = 0; i < count; i++) {
-        script[script_size] = buffer[i];
-        script_size++;
+        current_profile.script[current_profile.script_size] = buffer[i];
+        current_profile.script_size++;
     }
     
-    SaveConfig();
+    SaveCurrentProfile();
     printf("Действие(я) успешно добавлено(ы)!\n");
     Sleep(1000);
 }
 
 void DeleteAction() {
-    if (script_size == 0) {
+    if (current_profile.script_size == 0) {
         printf("Скрипт пуст, нечего удалять.\n");
         _getch();
         return;
     }
-    printf("Введите номер действия для удаления (от 1 до %d) или 0 для отмены: ", script_size);
-    int index;
-    scanf_s("%d", &index);
+    printf("Введите номер действия для удаления (от 1 до %d) или 0 для отмены: ", current_profile.script_size);
+    int index = ReadIntInput();
 
     if (index == 0) return;
 
-    if (index < 1 || index > script_size) {
+    if (index < 1 || index > current_profile.script_size) {
         printf("Неверный номер действия!\n");
         _getch();
         return;
     }
 
-    for (int i = index - 1; i < script_size - 1; i++) {
-        script[i] = script[i + 1];
+    for (int i = index - 1; i < current_profile.script_size - 1; i++) {
+        current_profile.script[i] = current_profile.script[i + 1];
     }
-    script_size--;
-    SaveConfig();
+    current_profile.script_size--;
+    SaveCurrentProfile();
     printf("Действие удалено!\n");
     Sleep(1000);
 }
 
 void ModifyAction() {
-    if (script_size == 0) {
+    if (current_profile.script_size == 0) {
         printf("Скрипт пуст, нечего изменять.\n");
         _getch();
         return;
     }
-    printf("Введите номер действия для изменения (от 1 до %d) или 0 для отмены: ", script_size);
-    int index;
-    scanf_s("%d", &index);
+    printf("Введите номер действия для изменения (от 1 до %d) или 0 для отмены: ", current_profile.script_size);
+    int index = ReadIntInput();
 
     if (index == 0) return; 
 
-    if (index < 1 || index > script_size) {
+    if (index < 1 || index > current_profile.script_size) {
         printf("Неверный номер действия!\n");
         _getch();
         return;
@@ -360,50 +547,53 @@ void ModifyAction() {
     }
 
     if (count == 1) {
-        script[index - 1] = buffer[0];
+        current_profile.script[index - 1] = buffer[0];
     } 
     else if (count == 2) {
-        if (script_size >= MAX_ACTIONS) {
+        if (current_profile.script_size >= MAX_ACTIONS) {
             printf("Ошибка: невозможно расширить скрипт, лимит!\n");
             _getch();
             return;
         }
-        for (int i = script_size; i > index; i--) {
-            script[i] = script[i - 1];
+        for (int i = current_profile.script_size; i > index; i--) {
+            current_profile.script[i] = current_profile.script[i - 1];
         }
-        script[index - 1] = buffer[0];
-        script[index] = buffer[1];
-        script_size++;
+        current_profile.script[index - 1] = buffer[0];
+        current_profile.script[index] = buffer[1];
+        current_profile.script_size++;
     }
 
-    SaveConfig();
+    SaveCurrentProfile();
     printf("Действие успешно обновлено!\n");
     Sleep(1000);
 }
 
 void ChangeHotkeys() {
     DisplayAsciiKeyboard();
-    unsigned int hexKey;
     
     printf("\nВведите HEX-код для новой клавиши СТАРТА: ");
-    scanf_s("%x", &hexKey);
-    key_start = (WORD)hexKey;
+    unsigned int hexKey = ReadHexInput();
+    current_profile.key_start = (WORD)hexKey;
 
     printf("Введите HEX-код для новой клавиши СТОПА: ");
-    scanf_s("%x", &hexKey);
-    key_stop = (WORD)hexKey;
+    hexKey = ReadHexInput();
+    current_profile.key_stop = (WORD)hexKey;
 
-    SaveConfig();
+    SaveCurrentProfile();
     printf("Горячие клавиши обновлены!\n");
     Sleep(1000);
 }
 
 int main() {
+    timeBeginPeriod(1);
 
     SetConsoleCP(65001);
     SetConsoleOutputCP(65001);
 
-    LoadConfig();
+    CreateDirectoryA(PROFILES_DIR, NULL);
+
+    LoadProfileIndex();
+    LoadProfile(current_profile_index);
 
     hThread = CreateThread(NULL, 0, MacroThreadProc, NULL, 0, NULL);
 
@@ -420,12 +610,13 @@ int main() {
         printf("2. Удалить действие\n");
         printf("3. Изменить действие\n");
         printf("4. Изменить клавиши активации/деактивации\n");
-        printf("5. Выйти из программы\n");
+        printf("5. Управление профилями\n");
+        printf("[ESC] Выйти из программы\n");
         printf("\nВыберите пункт меню: ");
 
         in_main_menu = true; 
 
-        char choice = '0';
+        char choice = 0;
         while (!_kbhit()) {
             Sleep(50);
             static bool last_state = false;
@@ -456,10 +647,18 @@ int main() {
             system("cls");
             ChangeHotkeys();
         } else if (choice == '5') {
+            system("cls");
+            ManageProfiles();
+        } else if (choice == 27 || choice == '6' || choice == 'q' || choice == 'Q') {
             break;
         }
     }
 
-    if (hThread) TerminateThread(hThread, 0);
+    if (hThread) {
+        is_thread_active = FALSE;
+        WaitForSingleObject(hThread, 1000); 
+        CloseHandle(hThread); 
+    }
+    timeEndPeriod(1);
     return 0;
 }
